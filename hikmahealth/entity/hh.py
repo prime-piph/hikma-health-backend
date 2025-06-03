@@ -28,7 +28,7 @@ import dataclasses
 import json
 from urllib import parse as urlparse
 
-from hikmahealth.utils.misc import is_valid_uuid, safe_json_dumps
+from hikmahealth.utils.misc import is_valid_uuid, safe_json_dumps, safe_json_loads
 from hikmahealth.entity.helpers import SimpleCRUD, get_from_dict
 import uuid
 
@@ -566,34 +566,51 @@ class Event(SyncToClient, SyncToServer):
 
         vid = data.get('visit_id')
         if vid is not None:
+            # Validate visit ID
+            vid_is_uuid = is_valid_uuid(vid);
             exists = False
 
-            cur.execute(
-                """
-                SELECT EXISTS(SELECT 1 FROM visits WHERE id = %s)
-                """,
-                (vid,),
-            )
+            if vid_is_uuid:
+                cur.execute(
+                    """
+                    SELECT EXISTS(SELECT 1 FROM visits WHERE id = %s)
+                    """,
+                    (vid,),
+                )
 
-            d = cur.fetchone()
-            if d is not None:
-                exists = d[0]
+                d = cur.fetchone()
+                if d is not None:
+                    exists = d[0]
 
             if not exists:
-                logging.warning(
-                    f'Event {data["id"]} references non-existent visit {
-                        data["visit_id"]
-                    }. Setting visit_id to None.'
-                )
-                print(
-                    f'REVIEWER WARNING: Event {
-                        data["id"]
-                    } references non-existent visit {
-                        data["visit_id"]
-                    }. visit_id will be set to None.'
+                # Create a dynamic visit if it doesn't exist
+                placeholder_metadata = json.dumps({
+                    'artificially_created': True,
+                    'created_from': 'server_event_creation',
+                    'original_event_id': data['id'],
+                })
+                
+                vid = upsert_visit(
+                    visit_id=vid,
+                    patient_id=patient_id,
+                    clinic_id=None,
+                    provider_id=None,
+                    provider_name=None,
+                    check_in_timestamp=utc.now(),
+                    metadata=json.loads(placeholder_metadata),
+                    is_deleted=True
                 )
 
-                data['visit_id'] = None
+                data['visit_id'] = vid
+                
+                logging.info(
+                    f'Event {data["id"]} references non-existent visit {vid}. '
+                    f'Created a placeholder visit.'
+                )
+                print(
+                    f'REVIEWER INFO: Event {data["id"]} references non-existent '
+                    f'visit {vid}. Created a placeholder visit.'
+                )
 
         # --------------------------------------
 
@@ -614,16 +631,16 @@ class Event(SyncToClient, SyncToServer):
 
             if not exists:
                 logging.warning(
-                    f'Event {data["id"]} references non-existent visit {
+                    f'Form {data["id"]} references non-existent form {
                         data["form_id"]
                     }. Setting form_id to None.'
                 )
                 print(
-                    f'REVIEWER WARNING: Event {
+                    f'REVIEWER WARNING: Form {
                         data["id"]
-                    } references non-existent visit {
+                    } references non-existent form {
                         data["form_id"]
-                    }. visit_id will be set to None.'
+                    }. form_id will be set to None.'
                 )
 
                 data['form_id'] = None
@@ -1212,9 +1229,19 @@ class Appointment(SyncToClient, SyncToServer):
     def create_from_delta(cls, ctx, cur: Cursor, data: dict):
         assert data['id'] is not None
 
-        if data.get('patient_id') is not None:
+        # Handle patient_id
+        patient_id = data.get('patient_id')
+        if patient_id is None or not is_valid_uuid(patient_id):
+            # Only create a new patient if we don't have a valid patient_id
             data['patient_id'] = str(uuid.uuid1())
             insert_placeholder_patient(ctx.conn, data['patient_id'], True)
+            logging.info(f"Created new placeholder patient {data['patient_id']} for appointment {data.get('id')}")
+        else:
+            # We have a valid UUID, check if patient exists
+            patient_exists = row_exists('patients', patient_id)
+            if not patient_exists:
+                insert_placeholder_patient(ctx.conn, patient_id, True)
+                logging.info(f"Created placeholder patient for existing ID {patient_id} for appointment {data.get('id')}")
 
         assert data['patient_id'] is not None
 
@@ -1223,20 +1250,25 @@ class Appointment(SyncToClient, SyncToServer):
             'created_from': 'server_appointment_creation',
             'original_appointment_id': data.get('id', ''),
         }
-        metadataobj = json.loads(data['metadata'])
-        if metadataobj is not None:
+        metadataobj = safe_json_loads(data.get('metadata'), {}, attempt_double_decode=True)
+        if isinstance(metadataobj, dict):
             with_server_metadata = metadataobj | with_server_metadata
+        else:
+            logging.warning(f"Metadata for appointment {data.get('id')} is not a dictionary: {metadataobj}")
+
 
         curr_vid = data.get('current_visit_id')
         if curr_vid is not None:
-            visit_exists = row_exists('visits', curr_vid)
-
-            if not visit_exists:
-                data['current_visit_id'] = curr_vid
-
-        # still empty set new ID
-        if data.get('current_visit_id') is not None:
-            print(f'Invalid current_visit_id for appointment: {data.get("id")}')
+            if not is_valid_uuid(curr_vid):
+                logging.warning(f'Invalid UUID format for current_visit_id in appointment {data.get("id")}: {curr_vid}')
+                data['current_visit_id'] = str(uuid.uuid1())
+            else:
+                visit_exists = row_exists('visits', curr_vid)
+                if not visit_exists:
+                    logging.info(f'Creating new visit for appointment {data.get("id")} with id {curr_vid}')
+                    # Visit will be created by upsert_visit below
+        else:
+            # No visit ID provided, generate a new one
             data['current_visit_id'] = str(uuid.uuid1())
 
         upsert_visit(
@@ -1721,7 +1753,7 @@ def upsert_visit(
     This makes sure a visit exists and handles conflicts of primary keys (visit_id)
     """
     vid = visit_id
-    if vid is None:
+    if vid is None or not is_valid_uuid(vid):
         vid = str(uuid.uuid4())
 
     current_time = utc.now()
