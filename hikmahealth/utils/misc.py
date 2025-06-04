@@ -163,6 +163,48 @@ def safe_json_dumps(data, default=None):
 
     return output
 
+def safe_json_loads(data, default=None, attempt_double_decode=False):
+    """
+    Safely convert JSON string to Python object.
+
+    Args:
+        data: The JSON string or object to convert/validate
+        default: The default value to return if conversion fails (default is None)
+        attempt_double_decode: If True, attempts to decode twice in case of double-encoded JSON
+
+    Returns:
+        object: Python object representation of the JSON string, or the default value if conversion fails.
+        If input is already a dict/list, returns it as is.
+    """
+    # If data is None, return default
+    if data is None:
+        return default
+        
+    # If data is already a dict or list, return as is
+    if isinstance(data, (dict, list)):
+        return data
+
+    try:
+        if not isinstance(data, str):
+            return default
+            
+        result = json.loads(data)
+        
+        # Attempt second decode if the result is a string and looks like JSON
+        if attempt_double_decode and isinstance(result, str):
+            try:
+                if result.startswith('{') or result.startswith('['):
+                    second_result = json.loads(result)
+                    return second_result
+            except (TypeError, ValueError, json.JSONDecodeError):
+                # If second decode fails, return result from first decode
+                pass
+                
+        return result
+    except (TypeError, ValueError, json.JSONDecodeError) as e:
+        logging.warning(f'Failed to deserialize JSON: {str(e)}. Input was: {str(data)[:100]}')
+        return default
+
 
 def convert_operator(operator: str, case_insensitive: bool = True) -> str:
     """
